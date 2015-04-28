@@ -68,7 +68,6 @@ type endlessServer struct {
 	wg               sync.WaitGroup
 	sigChan          chan os.Signal
 	isChild          bool
-	state            uint8
 }
 
 /*
@@ -111,7 +110,6 @@ func NewServer(addr string, handler http.Handler) (srv *endlessServer) {
 				syscall.SIGTSTP: []func(){},
 			},
 		},
-		state: STATE_INIT,
 	}
 
 	srv.Server.Addr = addr
@@ -159,11 +157,10 @@ sync.Waitgroup so that all outstanding connections can be served before shutting
 down the server.
 */
 func (srv *endlessServer) Serve() (err error) {
-	srv.state = STATE_RUNNING
+	go srv.handleSignals()
 	err = srv.Server.Serve(srv.EndlessListener)
 	log.Println(syscall.Getpid(), "Waiting for connections to finish...")
 	srv.wg.Wait()
-	srv.state = STATE_TERMINATE
 	return
 }
 
@@ -177,8 +174,15 @@ func (srv *endlessServer) ListenAndServe() (err error) {
 	if addr == "" {
 		addr = ":http"
 	}
-
-	go srv.handleSignals()
+	signal.Notify(
+		srv.sigChan,
+		syscall.SIGHUP,
+		syscall.SIGUSR1,
+		syscall.SIGUSR2,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGTSTP,
+	)
 
 	l, err := srv.getListener(addr)
 	if err != nil {
@@ -279,21 +283,8 @@ handleSignals listens for os Signals and calls any hooked in function that the
 user had registered with the signal.
 */
 func (srv *endlessServer) handleSignals() {
-	var sig os.Signal
-
-	signal.Notify(
-		srv.sigChan,
-		syscall.SIGHUP,
-		syscall.SIGUSR1,
-		syscall.SIGUSR2,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGTSTP,
-	)
-
 	pid := syscall.Getpid()
-	for {
-		sig = <-srv.sigChan
+	for sig := range srv.sigChan {
 		srv.signalHooks(PRE_SIGNAL, sig)
 		switch sig {
 		case syscall.SIGHUP:
@@ -306,13 +297,13 @@ func (srv *endlessServer) handleSignals() {
 			log.Println(pid, "Received SIGUSR1.")
 		case syscall.SIGUSR2:
 			log.Println(pid, "Received SIGUSR2.")
-			srv.hammerTime(0 * time.Second)
+			srv.shutdown(time.Duration(0))
 		case syscall.SIGINT:
 			log.Println(pid, "Received SIGINT.")
-			srv.shutdown()
+			srv.shutdown(DefaultHammerTime)
 		case syscall.SIGTERM:
 			log.Println(pid, "Received SIGTERM.")
-			srv.shutdown()
+			srv.shutdown(DefaultHammerTime)
 		case syscall.SIGTSTP:
 			log.Println(pid, "Received SIGTSTP.")
 		default:
@@ -335,22 +326,29 @@ func (srv *endlessServer) signalHooks(ppFlag int, sig os.Signal) {
 /*
 shutdown closes the listener so that no new connections are accepted. it also
 starts a goroutine that will hammer (stop all running requests) the server
-after DefaultHammerTime.
+after hammerAfter.
 */
-func (srv *endlessServer) shutdown() {
-	if srv.state != STATE_RUNNING {
-		return
-	}
-
-	srv.state = STATE_SHUTTING_DOWN
-	if DefaultHammerTime >= 0 {
-		go srv.hammerTime(DefaultHammerTime)
-	}
+func (srv *endlessServer) shutdown(hammerAfter time.Duration) {
 	err := srv.EndlessListener.Close()
 	if err != nil {
 		log.Println(syscall.Getpid(), "Listener.Close() error:", err)
 	} else {
 		log.Println(syscall.Getpid(), srv.EndlessListener.Addr(), "Listener closed.")
+	}
+	if hammerAfter >= time.Duration(0) {
+		done := make(chan bool)
+		go func() {
+			srv.wg.Wait()
+			done <- true
+		}()
+		go func() {
+			select {
+			case <-done:
+				break
+			case <-time.After(hammerAfter):
+				srv.hammerTime()
+			}
+		}()
 	}
 }
 
@@ -363,7 +361,7 @@ srv.Serve() will not return until all connections are served. this will
 unblock the srv.wg.Wait() in Serve() thus causing ListenAndServe(TLS) to
 return.
 */
-func (srv *endlessServer) hammerTime(d time.Duration) {
+func (srv *endlessServer) hammerTime() {
 	defer func() {
 		// we are calling srv.wg.Done() until it panics which means we called
 		// Done() when the counter was already at 0 and we're done.
@@ -372,15 +370,8 @@ func (srv *endlessServer) hammerTime(d time.Duration) {
 			log.Println("WaitGroup at 0", r)
 		}
 	}()
-	if srv.state != STATE_SHUTTING_DOWN {
-		return
-	}
-	time.Sleep(d)
 	log.Println("[STOP - Hammer Time] Forcefully shutting down parent")
 	for {
-		if srv.state == STATE_TERMINATE {
-			break
-		}
 		srv.wg.Done()
 	}
 }
@@ -447,9 +438,7 @@ func (srv *endlessServer) fork() (err error) {
 
 type endlessListener struct {
 	net.Listener
-	stop    chan error
-	stopped bool
-	server  *endlessServer
+	server *endlessServer
 }
 
 func (el *endlessListener) Accept() (c net.Conn, err error) {
@@ -470,30 +459,16 @@ func (el *endlessListener) Accept() (c net.Conn, err error) {
 	return
 }
 
-func newEndlessListener(l net.Listener, srv *endlessServer) (el *endlessListener) {
-	el = &endlessListener{
+func newEndlessListener(l net.Listener, srv *endlessServer) *endlessListener {
+	return &endlessListener{
 		Listener: l,
 		stop:     make(chan error),
 		server:   srv,
 	}
-
-	// Starting the listener for the stop signal here because Accept blocks on
-	// el.Listener.(*net.TCPListener).AcceptTCP()
-	// The goroutine will unblock it by closing the listeners fd
-	go func() {
-		_ = <-el.stop
-		el.stopped = true
-		el.stop <- el.Listener.Close()
-	}()
-	return
 }
 
 func (el *endlessListener) Close() error {
-	if el.stopped {
-		return syscall.EINVAL
-	}
-	el.stop <- nil
-	return <-el.stop
+	return el.Listener.Close()
 }
 
 func (el *endlessListener) File() *os.File {
