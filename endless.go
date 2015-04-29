@@ -462,7 +462,6 @@ func (el *endlessListener) Accept() (c net.Conn, err error) {
 func newEndlessListener(l net.Listener, srv *endlessServer) *endlessListener {
 	return &endlessListener{
 		Listener: l,
-		stop:     make(chan error),
 		server:   srv,
 	}
 }
